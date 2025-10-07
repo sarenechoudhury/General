@@ -11,21 +11,34 @@ import ast
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import shap
 
-# Ensure output directory exists
+def safe_qcut(series, q=3, labels=None):
+    """Safely perform qcut with duplicate handling."""
+    try:
+        result = pd.qcut(series, q=q, labels=labels, duplicates='drop')
+    except ValueError:
+        result = pd.cut(series, bins=q, labels=labels)
+    return result
+
 os.makedirs("figures", exist_ok=True)
 
-# Load main dataset
 df = pd.read_csv("cleaned_movies_metadata.csv")
 
-# Load and merge Rotten Tomatoes data
 rt = pd.read_csv("rotten_tomatoes_movies.csv")
 df = df.merge(rt[['title', 'rating']], how='left', on='title')
 df['rating'] = df['rating'].astype('category').cat.codes
 
-# Load and merge credits data
 credits = pd.read_csv("credits.csv")
 df = df.merge(credits[['id', 'cast', 'crew']], how='left', on='id')
+
+# Missing Values Heatmap
+plt.figure(figsize=(8, 5))
+sns.heatmap(df.isnull(), cbar = False)
+plt.title("Missing Values")
+plt.tight_layout()
+plt.savefig("figures/missing_values.png")
+plt.close()
 
 # Parse cast and crew features
 def parse_cast(cast_str):
@@ -46,6 +59,25 @@ df['num_top_cast'] = df['cast'].apply(parse_cast)
 df['num_directors'] = df['crew'].apply(lambda x: parse_crew(x, 'Directing'))
 df['num_writers'] = df['crew'].apply(lambda x: parse_crew(x, 'Writing'))
 df['num_producers'] = df['crew'].apply(lambda x: parse_crew(x, 'Production'))
+
+plt.figure(figsize=(10,8))
+sns.heatmap(df[['budget','popularity','runtime','rating',
+                'num_top_cast','num_directors','num_writers',
+                'num_producers','revenue']].corr(),
+            annot=True, fmt=".2f", cmap="coolwarm")
+plt.title("Feature Correlation Matrix")
+plt.tight_layout()
+plt.savefig("figures/correlation_matrix.png")
+plt.close()
+
+# Compare feature distributions by revenue group
+df['revenue_group'] = safe_qcut(df['revenue'], q=3, labels=['Low','Medium','High'])
+plt.figure(figsize=(8,5))
+sns.boxplot(data=df, x='revenue_group', y='budget')
+plt.title("Budget Distribution Across Revenue Groups")
+plt.tight_layout()
+plt.savefig("figures/budget_by_revenue_group.png")
+plt.close()
 
 # Visualization 1: Revenue Distribution
 plt.figure(figsize=(8, 5))
@@ -68,18 +100,6 @@ plt.ylabel("Revenue")
 plt.tight_layout()
 plt.savefig("figures/budget_vs_revenue.png")
 plt.close()
-
-# Visualization 3: Average Revenue by Genre
-if 'main_genre' in df.columns:
-    genre_revenue = df.groupby('main_genre')['revenue'].mean().sort_values(ascending=False)
-    plt.figure(figsize=(10, 6))
-    sns.barplot(x=genre_revenue.values, y=genre_revenue.index)
-    plt.title("Average Revenue by Genre")
-    plt.xlabel("Average Revenue")
-    plt.ylabel("Main Genre")
-    plt.tight_layout()
-    plt.savefig("figures/genre_revenue.png")
-    plt.close()
 
 # Feature selection
 features = ['budget', 'popularity', 'runtime', 'rating', 
@@ -128,6 +148,26 @@ for iteration in range(N_ITER):
     early_stop = EarlyStopping(patience=10, restore_best_weights=True, verbose=0)
     ann_model.fit(X_train_scaled, y_resid, 
                   validation_split=0.2, epochs=100, batch_size=32, callbacks=[early_stop], verbose=0)
+    
+    try:
+    
+
+        # Use small subset to keep computation light
+        X_background = X_train_scaled[np.random.choice(X_train_scaled.shape[0], 100, replace=False)]
+        X_explain = X_test_scaled[:100]
+
+        deep_explainer = shap.DeepExplainer(ann_model, X_background)
+        shap_values_deep = deep_explainer.shap_values(X_explain)
+
+        # Plot SHAP summary for this iteration
+        shap.summary_plot(shap_values_deep, X_explain, show=False)
+        plt.title(f"Deep SHAP Summary (ANN Iteration {iteration + 1})")
+        plt.savefig(f"figures/deep_shap_iter{iteration + 1}.png", bbox_inches='tight')
+        plt.close()
+
+    except Exception as e:
+        print(f"⚠️ Skipped Deep SHAP at iteration {iteration + 1}: {e}")
+
 
     ann_train_features = ann_model.predict(X_train_scaled)
     ann_test_features = ann_model.predict(X_test_scaled)
@@ -145,6 +185,38 @@ final_preds = final_model.predict(X_test_aug)
 rmse = np.sqrt(mean_squared_error(y_test, final_preds))
 print(f"\n✅ Final AugBoost RMSE: {rmse:.4f}")
 
+importances = final_model.feature_importance()
+feature_names = final_model.feature_name()
+
+imp_df = pd.DataFrame({'Feature': feature_names, 'Importance': importances})
+imp_df = imp_df.sort_values(by='Importance', ascending=False)
+
+plt.figure(figsize=(10,6))
+sns.barplot(data=imp_df.head(15), x='Importance', y='Feature')
+plt.title("Top 15 Feature Importances (LightGBM)")
+plt.tight_layout()
+plt.savefig("figures/feature_importance.png")
+plt.close()
+
+explainer = shap.TreeExplainer(final_model)
+
+# Use a manageable sample for efficiency
+X_sample = X_test_aug.sample(n=min(500, len(X_test_aug)), random_state=42)
+
+shap_values = explainer.shap_values(X_sample)
+
+# Summary plot of feature importance
+shap.summary_plot(shap_values, X_sample, show=False)
+plt.title("Tree SHAP Summary: Final LightGBM Model")
+plt.savefig("figures/shap_summary_lightgbm.png", bbox_inches='tight')
+plt.close()
+
+# Optional: Feature importance bar plot (SHAP-based)
+shap.summary_plot(shap_values, X_sample, plot_type="bar", show=False)
+plt.title("Tree SHAP Feature Importance (Bar)")
+plt.savefig("figures/shap_bar_lightgbm.png", bbox_inches='tight')
+plt.close()
+
 # Save final performance comparison plot
 plt.figure(figsize=(8, 5))
 plt.scatter(y_test, final_preds, alpha=0.5)
@@ -155,6 +227,50 @@ plt.tight_layout()
 plt.savefig("figures/final_model_performance.png")
 plt.close()
 
+# === Model Evaluation and Diagnostics ===
+residuals = y_test - final_preds
+
+# Residual Plot
+plt.figure(figsize=(8,5))
+sns.scatterplot(x=y_test, y=residuals, alpha=0.5)
+plt.axhline(0, color='red', linestyle='--')
+plt.title("Residuals vs Actual Log Revenue")
+plt.xlabel("Actual Log Revenue")
+plt.ylabel("Residuals")
+plt.tight_layout()
+plt.savefig("figures/residual_plot.png")
+plt.close()
+
+# Residual Distribution
+plt.figure(figsize=(8,5))
+sns.histplot(residuals, bins=30, kde=True)
+plt.title("Distribution of Prediction Errors (Residuals)")
+plt.xlabel("Residual (y_true - y_pred)")
+plt.tight_layout()
+plt.savefig("figures/residual_distribution.png")
+plt.close()
+
+# Actual vs Predicted with Trend Line
+plt.figure(figsize=(8,5))
+sns.regplot(x=y_test, y=final_preds, scatter_kws={'alpha':0.5}, line_kws={'color':'red'})
+plt.title("Actual vs Predicted Log Revenue with Trend Line")
+plt.xlabel("Actual Log Revenue")
+plt.ylabel("Predicted Log Revenue")
+plt.tight_layout()
+plt.savefig("figures/actual_vs_predicted_trend.png")
+plt.close()
+
+# === Actual vs Predicted Revenue in Dollars ===
+plt.figure(figsize=(8,5))
+sns.scatterplot(x=np.expm1(y_test), y=np.expm1(final_preds), alpha=0.5)
+plt.title("Actual vs Predicted Revenue ($)")
+plt.xlabel("Actual Revenue")
+plt.ylabel("Predicted Revenue")
+plt.xscale('log')
+plt.yscale('log')
+plt.tight_layout()
+plt.savefig("figures/actual_vs_predicted_revenue_dollars.png")
+plt.close()
 
 
 
